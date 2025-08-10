@@ -8,15 +8,17 @@ function App() {
   const [projectType, setProjectType] = useState('react-app');
   const [prompt, setPrompt] = useState('');
   const [output, setOutput] = useState('');
+  const [testOutput, setTestOutput] = useState('');
+  const [corrected, setCorrected] = useState(false);
   const [folderPath, setFolderPath] = useState('./generated');
   const [onlyCode, setOnlyCode] = useState(true);
   const [loading, setLoading] = useState(false);
   const [resetting, setResetting] = useState(false);
 
   const templates = {
-    'react-app': 'Genera una app React completa, includendo tutti i file necessari. Specifica il nome e il contenuto di ogni file nel formato: // File: percorso/nomefile.ext seguito dal contenuto.',
-    'python-script': 'Genera uno script Python completo, includendo eventuali file esterni necessari. Specifica il nome e il contenuto di ogni file nel formato: // File: percorso/nomefile.ext seguito dal contenuto.',
-    'web-scraper': 'Genera un progetto completo per uno scraper web in Python, includendo file di configurazione, script e eventuali risorse. Usa il formato: // File: percorso/nomefile.ext seguito dal contenuto.'
+    'react-app': 'Genera una app React completa, includendo tutti i file necessari. Specifica il nome e il contenuto di ogni file nel formato: // File: percorso/nomefile.ext seguito dal contenuto. Includi anche test con Jest.',
+    'python-script': 'Genera uno script Python completo, includendo eventuali file esterni necessari. Specifica il nome e il contenuto di ogni file nel formato: // File: percorso/nomefile.ext seguito dal contenuto. Includi anche test.',
+    'web-scraper': 'Genera un progetto completo per uno scraper web in Python, includendo file di configurazione, script e eventuali risorse. Usa il formato: // File: percorso/nomefile.ext seguito dal contenuto. Includi anche test.'
   };
 
   useEffect(() => {
@@ -33,6 +35,8 @@ function App() {
 
   const handleGenerate = () => {
     setLoading(true);
+    setCorrected(false);
+    setTestOutput('');
     axios.post('http://localhost:3001/api/generate', {
       model: selectedModel,
       prompt,
@@ -41,8 +45,13 @@ function App() {
     })
     .then(res => {
       setOutput(res.data.response || 'Nessuna risposta');
+      setTestOutput(res.data.testOutput || '');
+      setCorrected(res.data.corrected || false);
     })
-    .catch(err => console.error('Errore nella generazione:', err))
+    .catch(err => {
+      console.error('Errore nella generazione:', err);
+      setOutput('❌ Errore nella generazione.');
+    })
     .finally(() => setLoading(false));
   };
 
@@ -51,6 +60,8 @@ function App() {
     axios.post('http://localhost:3001/api/reset')
       .then(() => {
         setOutput('');
+        setTestOutput('');
+        setCorrected(false);
         alert('✅ Conversazione resettata con successo.');
       })
       .catch(err => {
@@ -116,6 +127,19 @@ function App() {
 
       <h2>Risultato:</h2>
       <pre className="output">{output}</pre>
+
+      {testOutput && (
+        <>
+          <h2>🧪 Output dei test:</h2>
+          <pre className="output">{testOutput}</pre>
+        </>
+      )}
+
+      {corrected && (
+        <div style={{ color: 'orange', marginTop: '10px' }}>
+          ⚠️ Il codice è stato corretto automaticamente a causa di errori nei test.
+        </div>
+      )}
     </div>
   );
 }

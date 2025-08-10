@@ -3,6 +3,7 @@ const axios = require('axios');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 const app = express();
 const PORT = 3001;
@@ -57,7 +58,7 @@ function detectFileExtension(code) {
     '.ts': [/import\s.*from\s.*;/, /let\s/, /const\s/, /function\s/],
     '.go': [/package\s+main/, /func\s+main\(\)/, /import\s+"fmt"/],
     '.rb': [/def\s/, /class\s/, /puts\s/],
-    '.php': [/<?php/, /echo\s/, /\$\w+/],
+    '.php': [/<\?php/, /echo\s/, /\$\w+/],
   };
 
   for (const [ext, regexList] of Object.entries(patterns)) {
@@ -68,16 +69,6 @@ function detectFileExtension(code) {
 
   return '.txt';
 }
-
-app.get('/api/models', async (req, res) => {
-  try {
-    const response = await axios.get('http://localhost:11434/api/tags');
-    res.json(response.data);
-  } catch (error) {
-    console.error('Errore nel recupero dei modelli:', error.message);
-    res.status(500).json({ error: 'Errore nel recupero dei modelli' });
-  }
-});
 
 function parseAndCreateFiles(responseText, baseFolder = './generated/project') {
   const pattern = /\/\/\s*File:\s*(.*?)\n([\s\S]*?)(?=(\/\/\s*File:|$))/g;
@@ -97,11 +88,57 @@ function parseAndCreateFiles(responseText, baseFolder = './generated/project') {
   return createdFiles;
 }
 
+function runTestsInFolder(folderPath) {
+  try {
+    const result = execSync(`npx jest ${folderPath}`, { encoding: 'utf-8' });
+    return { success: true, output: result };
+  } catch (error) {
+    return { success: false, output: error.stdout || error.message };
+  }
+}
+
+async function correctCodeWithModel(model, originalPrompt, errorMessage) {
+  const correctionPrompt = `${originalPrompt}\n\nIl codice generato ha prodotto questo errore:\n${errorMessage}\n\nCorreggilo.`;
+
+  const response = await axios({
+    method: 'post',
+    url: 'http://localhost:11434/api/generate',
+    data: { model, prompt: correctionPrompt },
+    responseType: 'stream'
+  });
+
+  let correctedOutput = '';
+  for await (const chunk of response.data) {
+    const lines = chunk.toString().split('\n').filter(Boolean);
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.response) {
+          correctedOutput += parsed.response;
+        }
+      } catch (err) {
+        console.warn('⚠️ Ignorato chunk non valido durante correzione:', line);
+      }
+    }
+  }
+
+  return correctedOutput;
+}
+
+app.get('/api/models', async (req, res) => {
+  try {
+    const response = await axios.get('http://localhost:11434/api/tags');
+    res.json(response.data);
+  } catch (error) {
+    console.error('Errore nel recupero dei modelli:', error.message);
+    res.status(500).json({ error: 'Errore nel recupero dei modelli' });
+  }
+});
+
 app.post('/api/generate', async (req, res) => {
   const { model, prompt, folder, onlyCode } = req.body;
   const folderPath = folder || './generated';
 
-  // 🧠 Costruzione del prompt con contesto
   const fullPrompt = conversationHistory.map(entry => `Utente: ${entry.prompt}\nModello: ${entry.response}`).join('\n\n') + `\n\nUtente: ${prompt}`;
 
   try {
@@ -115,38 +152,69 @@ app.post('/api/generate', async (req, res) => {
     let output = '';
 
     response.data.on('data', chunk => {
-      try {
-        const lines = chunk.toString().split('\n').filter(Boolean);
-        for (const line of lines) {
+      const lines = chunk.toString().split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
           const parsed = JSON.parse(line);
           if (parsed.response) {
             output += parsed.response;
           }
+        } catch (err) {
+          console.warn('⚠️ Ignorato chunk non valido:', line);
         }
-      } catch (err) {
-        console.error('Errore nel parsing del chunk:', err.message);
       }
     });
 
-    response.data.on('end', () => {
+    response.data.on('end', async () => {
       const finalOutput = onlyCode ? extractCodeBlocks(output) : output;
 
-      // 🧠 Aggiorna la storia della conversazione
       conversationHistory.push({ prompt, response: finalOutput });
       saveConversationHistory();
 
+      let createdFiles = [];
+      let filePath = '';
+
       if (finalOutput.includes('// File:')) {
-        const createdFiles = parseAndCreateFiles(finalOutput, folderPath);
-        res.json({ response: finalOutput, files: createdFiles });
+        createdFiles = parseAndCreateFiles(finalOutput, folderPath);
       } else {
         const extension = detectFileExtension(finalOutput);
         const fileName = `output_${Date.now()}${extension}`;
-        const fullPath = path.join(folderPath, fileName);
-
+        filePath = path.join(folderPath, fileName);
         fs.mkdirSync(folderPath, { recursive: true });
-        fs.writeFileSync(fullPath, finalOutput, 'utf-8');
-        res.json({ response: finalOutput, filePath: fullPath });
+        fs.writeFileSync(filePath, finalOutput, 'utf-8');
       }
+
+      const testResult = runTestsInFolder(folderPath);
+      if (!testResult.success) {
+        console.log('❌ Test falliti, provo a correggere...');
+        const correctedOutput = await correctCodeWithModel(model, prompt, testResult.output);
+
+        if (correctedOutput.includes('// File:')) {
+          createdFiles = parseAndCreateFiles(correctedOutput, folderPath);
+        } else {
+          const extension = detectFileExtension(correctedOutput);
+          const fileName = `corrected_${Date.now()}${extension}`;
+          filePath = path.join(folderPath, fileName);
+          fs.writeFileSync(filePath, correctedOutput, 'utf-8');
+        }
+
+        conversationHistory.push({ prompt: `${prompt} (corretto)`, response: correctedOutput });
+        saveConversationHistory();
+
+        return res.json({
+          response: correctedOutput,
+          files: createdFiles.length > 0 ? createdFiles : [filePath],
+          testOutput: testResult.output,
+          corrected: true
+        });
+      }
+
+      res.json({
+        response: finalOutput,
+        files: createdFiles.length > 0 ? createdFiles : [filePath],
+        testOutput: testResult.output,
+        corrected: false
+      });
     });
 
   } catch (error) {
@@ -155,7 +223,6 @@ app.post('/api/generate', async (req, res) => {
   }
 });
 
-// 🔄 Endpoint per resettare la storia
 app.post('/api/reset', (req, res) => {
   conversationHistory = [];
   saveConversationHistory();
